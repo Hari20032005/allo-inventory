@@ -1,11 +1,12 @@
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 
-const prisma = new PrismaClient();
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
+const prisma = new PrismaClient({ adapter });
 
 async function main() {
   console.log("Seeding database…");
 
-  // Warehouses
   const mumbai = await prisma.warehouse.upsert({
     where: { id: "wh-mumbai" },
     update: {},
@@ -22,7 +23,6 @@ async function main() {
     create: { id: "wh-bangalore", name: "Bangalore Tech Park", location: "Bangalore, KA" },
   });
 
-  // Products
   const airpods = await prisma.product.upsert({
     where: { sku: "APPLE-AP3" },
     update: {},
@@ -42,7 +42,7 @@ async function main() {
     create: {
       id: "prod-macbook",
       sku: "APPLE-MBP-M4",
-      name: "MacBook Pro 14\" M4",
+      name: 'MacBook Pro 14" M4',
       description: "Apple M4 chip, 16GB RAM, 512GB SSD. Space Black.",
       price: 168900,
       imageUrl: "https://images.unsplash.com/photo-1517336714731-489689fd1ca8?w=800&q=80",
@@ -62,14 +62,13 @@ async function main() {
     },
   });
 
-  // Stock — deliberately scarce to demo race conditions
   const stockData = [
     { productId: airpods.id, warehouseId: mumbai.id, totalQuantity: 3 },
-    { productId: airpods.id, warehouseId: delhi.id, totalQuantity: 1 }, // only 1 left!
+    { productId: airpods.id, warehouseId: delhi.id, totalQuantity: 1 },
     { productId: macbook.id, warehouseId: mumbai.id, totalQuantity: 2 },
-    { productId: macbook.id, warehouseId: bangalore.id, totalQuantity: 0 }, // out of stock
+    { productId: macbook.id, warehouseId: bangalore.id, totalQuantity: 0 },
     { productId: sony.id, warehouseId: delhi.id, totalQuantity: 5 },
-    { productId: sony.id, warehouseId: bangalore.id, totalQuantity: 1 }, // only 1 left!
+    { productId: sony.id, warehouseId: bangalore.id, totalQuantity: 1 },
   ];
 
   for (const s of stockData) {
