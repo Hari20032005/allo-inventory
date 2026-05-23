@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { CreateReservationSchema } from "@/lib/schemas";
+import { getIdempotentResponse, setIdempotentResponse } from "@/lib/idempotency";
 import { Prisma } from "@prisma/client";
 
 const RESERVATION_TTL_MINUTES = 10;
@@ -8,14 +9,11 @@ const RESERVATION_TTL_MINUTES = 10;
 export async function POST(req: NextRequest) {
   const idempotencyKey = req.headers.get("Idempotency-Key");
 
-  // Idempotency: return cached response if key was seen before
+  // Return cached response for duplicate requests with the same key
   if (idempotencyKey) {
-    const existing = await prisma.reservation.findUnique({
-      where: { idempotencyKey },
-      include: { stock: { include: { product: true, warehouse: true } } },
-    });
-    if (existing) {
-      return NextResponse.json(formatReservation(existing), { status: 200 });
+    const cached = await getIdempotentResponse(`reserve:${idempotencyKey}`);
+    if (cached) {
+      return NextResponse.json(cached.body, { status: cached.status });
     }
   }
 
@@ -51,7 +49,6 @@ export async function POST(req: NextRequest) {
         throw new Error("INSUFFICIENT_STOCK");
       }
 
-      // Atomically increment reserved quantity
       await tx.stock.update({
         where: { id: stock.id },
         data: { reservedQuantity: { increment: quantity } },
@@ -64,13 +61,21 @@ export async function POST(req: NextRequest) {
           stockId: stock.id,
           quantity,
           expiresAt,
+          // Store the key on the row as a secondary idempotency guard
           idempotencyKey: idempotencyKey ?? undefined,
         },
         include: { stock: { include: { product: true, warehouse: true } } },
       });
     });
 
-    return NextResponse.json(formatReservation(reservation), { status: 201 });
+    const responseBody = formatReservation(reservation);
+
+    // Cache the successful response in Redis
+    if (idempotencyKey) {
+      await setIdempotentResponse(`reserve:${idempotencyKey}`, 201, responseBody);
+    }
+
+    return NextResponse.json(responseBody, { status: 201 });
   } catch (err) {
     const message = err instanceof Error ? err.message : "";
     if (message === "INSUFFICIENT_STOCK") {

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getIdempotentResponse, setIdempotentResponse } from "@/lib/idempotency";
 
 export async function POST(
   req: NextRequest,
@@ -8,12 +9,19 @@ export async function POST(
   const { id } = await params;
   const idempotencyKey = req.headers.get("Idempotency-Key");
 
+  // Return cached response for duplicate requests with the same key
+  if (idempotencyKey) {
+    const cached = await getIdempotentResponse(`confirm:${idempotencyKey}`);
+    if (cached) {
+      return NextResponse.json(cached.body, { status: cached.status });
+    }
+  }
+
   const reservation = await prisma.reservation.findUnique({ where: { id } });
   if (!reservation) {
     return NextResponse.json({ error: "Reservation not found." }, { status: 404 });
   }
 
-  // Idempotency: already confirmed
   if (reservation.status === "CONFIRMED") {
     return NextResponse.json({ id, status: "CONFIRMED" });
   }
@@ -23,7 +31,6 @@ export async function POST(
   }
 
   if (reservation.expiresAt < new Date()) {
-    // Lazy release expired reservation
     await prisma.$transaction(async (tx) => {
       await tx.stock.update({
         where: { id: reservation.stockId },
@@ -37,7 +44,7 @@ export async function POST(
     );
   }
 
-  // Confirming: decrement total stock (reservation already held the units)
+  // Confirming: permanently decrement total stock and clear the reservation hold
   await prisma.$transaction(async (tx) => {
     await tx.stock.update({
       where: { id: reservation.stockId },
@@ -49,6 +56,11 @@ export async function POST(
     await tx.reservation.update({ where: { id }, data: { status: "CONFIRMED" } });
   });
 
-  void idempotencyKey; // stored on the reservation row at creation time
-  return NextResponse.json({ id, status: "CONFIRMED" });
+  const responseBody = { id, status: "CONFIRMED" };
+
+  if (idempotencyKey) {
+    await setIdempotentResponse(`confirm:${idempotencyKey}`, 200, responseBody);
+  }
+
+  return NextResponse.json(responseBody);
 }

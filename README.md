@@ -87,13 +87,15 @@ The two mechanisms together ensure: **at most 1 minute of "phantom hold" on stoc
 
 ## Idempotency (bonus)
 
-`POST /api/reservations` and `POST /api/reservations/:id/confirm` honour the `Idempotency-Key` header.
+`POST /api/reservations` and `POST /api/reservations/:id/confirm` both honour the `Idempotency-Key` header.
 
-**Reserve:** The key is stored on the `Reservation` row (`idempotencyKey UNIQUE`). On receipt of a request, the endpoint first queries for an existing reservation with that key and returns it immediately — no second write, no lock contention.
+**Implementation:** Both endpoints use Redis as the idempotency store (`src/lib/idempotency.ts`). On first request, the response is cached in Redis under `idempotency:reserve:<key>` or `idempotency:confirm:<key>` with a 24-hour TTL. On any subsequent request with the same key, the cached `{ status, body }` is returned directly — no database write, no lock acquisition.
 
-**Confirm:** The status check (`if (reservation.status === "CONFIRMED") return 200`) naturally makes confirm idempotent — retrying a confirmed reservation is a no-op.
+**Reserve additionally** stores the key on the `Reservation` row (`idempotencyKey UNIQUE`) as a secondary guard. If Redis is unavailable, the `UNIQUE` constraint on the DB row will catch a true duplicate insert and prevent a double-reservation.
 
-The frontend generates a fresh `crypto.randomUUID()` for every new reserve button click, so legitimate retries (network timeout, double-submit) are protected, but a second deliberate click creates a new reservation.
+**Why Redis over DB-only:** Storing the full response body (not just the key) in Redis means retries get back exactly the original response, including fields like `expiresAt` that would differ if re-computed. The DB constraint alone can't replay the original response.
+
+The frontend generates a fresh `crypto.randomUUID()` per Reserve button click, so network retries are protected, but deliberate re-clicks create new reservations.
 
 ---
 
