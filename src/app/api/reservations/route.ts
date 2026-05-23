@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { CreateReservationSchema } from "@/lib/schemas";
 import { getIdempotentResponse, setIdempotentResponse } from "@/lib/idempotency";
+import type { ReservationWithRelations, ReservationResponse } from "@/lib/types";
 import { Prisma } from "@prisma/client";
 
 const RESERVATION_TTL_MINUTES = 10;
@@ -9,7 +10,6 @@ const RESERVATION_TTL_MINUTES = 10;
 export async function POST(req: NextRequest) {
   const idempotencyKey = req.headers.get("Idempotency-Key");
 
-  // Return cached response for duplicate requests with the same key
   if (idempotencyKey) {
     const cached = await getIdempotentResponse(`reserve:${idempotencyKey}`);
     if (cached) {
@@ -27,8 +27,8 @@ export async function POST(req: NextRequest) {
 
   try {
     const reservation = await prisma.$transaction(async (tx) => {
-      // SELECT FOR UPDATE locks this row for the duration of the transaction,
-      // preventing concurrent reservations from reading a stale reservedQuantity.
+      // SELECT FOR UPDATE locks this row for the transaction duration,
+      // preventing concurrent reads of a stale reservedQuantity.
       const stocks = await tx.$queryRaw<
         { id: string; total_quantity: number; reserved_quantity: number }[]
       >(Prisma.sql`
@@ -38,16 +38,11 @@ export async function POST(req: NextRequest) {
         FOR UPDATE
       `);
 
-      if (!stocks.length) {
-        throw new Error("STOCK_NOT_FOUND");
-      }
+      if (!stocks.length) throw new Error("STOCK_NOT_FOUND");
 
       const stock = stocks[0];
       const available = stock.total_quantity - stock.reserved_quantity;
-
-      if (available < quantity) {
-        throw new Error("INSUFFICIENT_STOCK");
-      }
+      if (available < quantity) throw new Error("INSUFFICIENT_STOCK");
 
       await tx.stock.update({
         where: { id: stock.id },
@@ -61,16 +56,14 @@ export async function POST(req: NextRequest) {
           stockId: stock.id,
           quantity,
           expiresAt,
-          // Store the key on the row as a secondary idempotency guard
           idempotencyKey: idempotencyKey ?? undefined,
         },
         include: { stock: { include: { product: true, warehouse: true } } },
-      });
+      }) as Promise<ReservationWithRelations>;
     });
 
     const responseBody = formatReservation(reservation);
 
-    // Cache the successful response in Redis
     if (idempotencyKey) {
       await setIdempotentResponse(`reserve:${idempotencyKey}`, 201, responseBody);
     }
@@ -89,8 +82,7 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatReservation(r: any) {
+function formatReservation(r: ReservationWithRelations): ReservationResponse {
   return {
     id: r.id,
     quantity: r.quantity,

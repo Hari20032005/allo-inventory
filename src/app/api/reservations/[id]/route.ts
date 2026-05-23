@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import type { ReservationWithRelations, ReservationResponse } from "@/lib/types";
 
 export async function GET(
   _req: NextRequest,
@@ -10,13 +11,13 @@ export async function GET(
   const reservation = await prisma.reservation.findUnique({
     where: { id },
     include: { stock: { include: { product: true, warehouse: true } } },
-  });
+  }) as ReservationWithRelations | null;
 
   if (!reservation) {
     return NextResponse.json({ error: "Reservation not found." }, { status: 404 });
   }
 
-  // Lazy expiry: if PENDING and past expiresAt, release it
+  // Lazy expiry: release inline if the timer ran out
   if (reservation.status === "PENDING" && reservation.expiresAt < new Date()) {
     const released = await prisma.$transaction(async (tx) => {
       await tx.stock.update({
@@ -27,7 +28,7 @@ export async function GET(
         where: { id },
         data: { status: "RELEASED" },
         include: { stock: { include: { product: true, warehouse: true } } },
-      });
+      }) as Promise<ReservationWithRelations>;
     });
     return NextResponse.json(formatReservation(released));
   }
@@ -35,8 +36,7 @@ export async function GET(
   return NextResponse.json(formatReservation(reservation));
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatReservation(r: any) {
+function formatReservation(r: ReservationWithRelations): ReservationResponse {
   return {
     id: r.id,
     quantity: r.quantity,
