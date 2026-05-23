@@ -69,19 +69,15 @@ This approach does not require Redis for correctness. Redis is used only for the
 
 ## How reservation expiry works in production
 
-### Primary: Vercel Cron (every minute)
+### Primary: lazy cleanup on read (the real-time guarantee)
 
-`vercel.json` schedules `GET /api/cron/expire-reservations` to run every minute. The endpoint:
+`GET /api/reservations/:id` and `POST /api/reservations/:id/confirm` both check `expiresAt` inline and immediately release expired reservations in the same transaction. This means stock is returned the instant any user or endpoint touches an expired reservation — no background job needed for correctness.
 
-1. Queries for all `PENDING` reservations where `expiresAt < now`.
-2. For each, runs a transaction: decrements `reservedQuantity` on the `Stock` row and sets the reservation `status = RELEASED`.
-3. Is protected by a `CRON_SECRET` bearer token so it can't be triggered by random callers.
+### Secondary: Vercel Cron (daily garbage collection)
 
-### Secondary: lazy cleanup on read
+`vercel.json` schedules `GET /api/cron/expire-reservations` to run once per day at 2am UTC. This sweeps up any expired `PENDING` reservations that were never read after expiry (e.g. a user who closed the tab). The endpoint is protected by a `CRON_SECRET` bearer token.
 
-`GET /api/reservations/:id` and `POST /api/reservations/:id/confirm` both check expiry and release inline. This means a reservation is always in a consistent state when the user is looking at it, even if the cron job hasn't fired yet.
-
-The two mechanisms together ensure: **at most 1 minute of "phantom hold" on stock** in the worst case (cron just fired, new reservation expires immediately, next cron fires in 59s), plus **instant cleanup** the moment a user or the confirm endpoint touches the reservation.
+> **Note:** Vercel's hobby plan only supports daily cron jobs. The designed architecture assumed per-minute cron as the primary mechanism, but because we have lazy cleanup on every read, correctness is maintained regardless — the cron is just a daily sweep of stale rows. On a Pro plan the cron would be changed back to `* * * * *`.
 
 ---
 
