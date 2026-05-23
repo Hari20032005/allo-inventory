@@ -2,7 +2,9 @@
 
 A Next.js application that implements a race-condition-free inventory reservation system for multi-warehouse retail. Customers can temporarily hold stock for 10 minutes while completing payment.
 
-**Live URL:** _[Add after deployment]_
+**Live URL:** https://allo-three.vercel.app
+
+**GitHub:** https://github.com/Hari20032005/allo-inventory
 
 ---
 
