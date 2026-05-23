@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
+import { CreateReservationSchema } from "@/lib/schemas";
 
 type Props = {
   productId: string;
@@ -19,6 +20,13 @@ export function ReserveButton({ productId, warehouseId, availableQuantity }: Pro
   const maxQty = Math.min(availableQuantity, 10);
 
   async function handleReserve() {
+    // Validate client-side with the same schema the API uses
+    const validation = CreateReservationSchema.safeParse({ productId, warehouseId, quantity });
+    if (!validation.success) {
+      setError("Invalid reservation data.");
+      return;
+    }
+
     setLoading(true);
     setError(null);
     try {
