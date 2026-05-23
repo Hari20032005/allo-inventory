@@ -1,0 +1,130 @@
+# Allo — Inventory Reservation System
+
+A Next.js application that implements a race-condition-free inventory reservation system for multi-warehouse retail. Customers can temporarily hold stock for 10 minutes while completing payment.
+
+**Live URL:** _[Add after deployment]_
+
+---
+
+## Running locally
+
+### 1. Prerequisites
+
+- Node.js 20+
+- A hosted Postgres instance (Neon, Supabase, Railway — free tiers work)
+- An Upstash Redis instance (free tier works)
+
+### 2. Environment variables
+
+```bash
+cp .env.example .env.local
+```
+
+Fill in the values:
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | Postgres connection string (with `?sslmode=require` for Neon/Supabase) |
+| `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL |
+| `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST token |
+| `CRON_SECRET` | Arbitrary secret that authenticates the cron endpoint |
+
+### 3. Migrate and seed
+
+```bash
+npm install
+npx prisma migrate dev --name init   # creates tables
+npm run db:seed                       # inserts demo products, warehouses, stock
+```
+
+### 4. Start
+
+```bash
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+---
+
+## How the concurrency guarantee works
+
+The core risk: two checkout requests arrive simultaneously for the last unit. Both read `reservedQuantity = 0`, both see 1 available, both succeed — and one customer ends up without a physical unit.
+
+**Solution: `SELECT FOR UPDATE` inside a serialisable Postgres transaction.**
+
+```sql
+-- src/app/api/reservations/route.ts
+SELECT id, "totalQuantity", "reservedQuantity"
+FROM "Stock"
+WHERE "productId" = $1 AND "warehouseId" = $2
+FOR UPDATE;
+```
+
+`FOR UPDATE` places a row-level exclusive lock on the `Stock` record for the lifetime of the transaction. The second concurrent request blocks at this line until the first transaction commits or rolls back. By the time it acquires the lock, `reservedQuantity` has already been incremented and it correctly sees 0 available units, returning a 409.
+
+This approach does not require Redis for correctness. Redis is used only for the optional idempotency layer.
+
+---
+
+## How reservation expiry works in production
+
+### Primary: Vercel Cron (every minute)
+
+`vercel.json` schedules `GET /api/cron/expire-reservations` to run every minute. The endpoint:
+
+1. Queries for all `PENDING` reservations where `expiresAt < now`.
+2. For each, runs a transaction: decrements `reservedQuantity` on the `Stock` row and sets the reservation `status = RELEASED`.
+3. Is protected by a `CRON_SECRET` bearer token so it can't be triggered by random callers.
+
+### Secondary: lazy cleanup on read
+
+`GET /api/reservations/:id` and `POST /api/reservations/:id/confirm` both check expiry and release inline. This means a reservation is always in a consistent state when the user is looking at it, even if the cron job hasn't fired yet.
+
+The two mechanisms together ensure: **at most 1 minute of "phantom hold" on stock** in the worst case (cron just fired, new reservation expires immediately, next cron fires in 59s), plus **instant cleanup** the moment a user or the confirm endpoint touches the reservation.
+
+---
+
+## Idempotency (bonus)
+
+`POST /api/reservations` and `POST /api/reservations/:id/confirm` honour the `Idempotency-Key` header.
+
+**Reserve:** The key is stored on the `Reservation` row (`idempotencyKey UNIQUE`). On receipt of a request, the endpoint first queries for an existing reservation with that key and returns it immediately — no second write, no lock contention.
+
+**Confirm:** The status check (`if (reservation.status === "CONFIRMED") return 200`) naturally makes confirm idempotent — retrying a confirmed reservation is a no-op.
+
+The frontend generates a fresh `crypto.randomUUID()` for every new reserve button click, so legitimate retries (network timeout, double-submit) are protected, but a second deliberate click creates a new reservation.
+
+---
+
+## API reference
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/products` | List all products with stock per warehouse |
+| `GET` | `/api/warehouses` | List all warehouses |
+| `POST` | `/api/reservations` | Create a reservation. Body: `{ productId, warehouseId, quantity }`. Returns 409 if stock is insufficient. |
+| `GET` | `/api/reservations/:id` | Get reservation details (triggers lazy expiry check) |
+| `POST` | `/api/reservations/:id/confirm` | Confirm reservation (payment success). Returns 410 if expired. |
+| `POST` | `/api/reservations/:id/release` | Release reservation early (cancellation) |
+| `GET` | `/api/cron/expire-reservations` | Cron endpoint — requires `Authorization: Bearer <CRON_SECRET>` |
+
+---
+
+## Trade-offs and what I'd do differently
+
+**What I chose and why:**
+
+- **`SELECT FOR UPDATE` over application-level locks (Redis Redlock):** Database-level locking is simpler, removes a failure mode (Redis outage = can't reserve), and is guaranteed correct by the DB's ACID machinery. Redis Redlock has well-documented edge cases with clock skew and network partitions. For a single Postgres instance (or a primary-replica pair), `FOR UPDATE` is the right tool.
+
+- **Lazy cleanup on read in addition to cron:** Vercel's hobby cron runs at 1-minute granularity. Without lazy cleanup, a user sitting on the checkout page would see a countdown reach zero but the reservation status would stay `PENDING` until the next cron tick. The lazy check makes the UI immediately consistent.
+
+- **No WebSocket / Server-Sent Events:** The countdown is driven entirely client-side from the `expiresAt` timestamp. The page re-fetches once the timer hits zero. This is simpler and sufficient for a 10-minute window — there's no need for a persistent connection.
+
+**With more time I would:**
+
+- Add a proper auth layer (session tokens, user IDs on reservations) so a user can't confirm or cancel someone else's reservation.
+- Add optimistic UI with `useSWR` or React Query for background polling, so stock counts refresh without a full page reload.
+- Write integration tests that spin up a real Postgres instance and fire concurrent reservation requests to verify the `FOR UPDATE` guarantee in CI.
+- Add a proper error boundary and toast notifications instead of inline error divs.
+- Paginate the product listing and add search/filter.
